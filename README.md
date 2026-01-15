@@ -31,7 +31,7 @@ Desenvolvi um algoritmo personalizado utilizando o solver CP-SAT do Google OR-To
 Em vez de apenas buscar uma média simples, o algoritmo penaliza exponencialmente desvios individuais.
 Resultado: O sistema "achata a curva" de distribuição, evitando que um produto apareça 12 vezes enquanto outros aparecem 9, garantindo homogeneidade quase perfeita (ex: todos ficam entre 9 e 10 aparições).
 
-ech Stack
+Tech Stack
 
 Frontend: [Streamlit](https://streamlit.io/) (Interface reativa e profissional).
 Engine de Otimização: [Google OR-Tools](https://developers.google.com/optimization) (CP-SAT Solver).
