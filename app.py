@@ -4,6 +4,7 @@ from ortools.sat.python import cp_model
 import io
 import re
 import math
+import random
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -37,7 +38,6 @@ with st.sidebar:
         pass
     # ---------------------------------------------------------
     
-    # (Texto "PAINEL DE CONTROLE" removido aqui)
     st.markdown("---")
     
     st.header("Configuração do Estudo")
@@ -86,7 +86,7 @@ with st.sidebar:
     st.markdown("---")
     btn_processar = st.button("PROCESSAR ALOCAÇÃO OTIMIZADA", type="primary")
 
-# --- MOTOR DE OTIMIZAÇÃO (NIVELAMENTO QUADRÁTICO) ---
+# --- MOTOR DE OTIMIZAÇÃO (HÍBRIDO: NIVELAMENTO + ENTROPIA) ---
 def gerar_rodizio_avancado(n_resp, l_fixos, l_rotativos, n_slots):
     todos = l_fixos + l_rotativos
     n_prod = len(todos)
@@ -95,15 +95,14 @@ def gerar_rodizio_avancado(n_resp, l_fixos, l_rotativos, n_slots):
     
     model = cp_model.CpModel()
     
-    # Variáveis x[respondente, coluna, produto]
+    # Variáveis
     x = {}
     for r in range(n_resp):
         for c in range(n_slots):
             for p in range(n_prod):
                 x[(r, c, p)] = model.NewBoolVar(f'x_{r}_{c}_{p}')
     
-    # --- RESTRIÇÕES RÍGIDAS (HARD) ---
-    
+    # --- HARD CONSTRAINTS ---
     # 1. Um produto por slot
     for r in range(n_resp):
         for c in range(n_slots):
@@ -119,34 +118,26 @@ def gerar_rodizio_avancado(n_resp, l_fixos, l_rotativos, n_slots):
         for r in range(n_resp):
             model.Add(sum(x[(r, c, idx)] for c in range(n_slots)) == 1)
 
-    # --- BALANCEAMENTO OTIMIZADO (QUADRÁTICO) ---
+    # --- SOFT CONSTRAINTS (PENALIDADES) ---
     penalidades = []
     
-    # Cálculos de Metas
+    # Metas Globais
     total_slots = n_resp * n_slots
     slots_rotativos_total = total_slots - (n_resp * n_fixos)
     
-    # A. Balanceamento Global (Rotativos)
     if n_rotativos > 0:
-        avg_global = slots_rotativos_total / n_rotativos
-        target_global = int(round(avg_global))
-        
-        for p in range(n_fixos, n_prod): # Apenas rotativos
+        target_global = int(round(slots_rotativos_total / n_rotativos))
+        for p in range(n_fixos, n_prod):
             soma = sum(x[(r, c, p)] for r in range(n_resp) for c in range(n_slots))
-            
             dev = model.NewIntVar(0, n_resp, f'dev_glob_{p}')
             model.Add(soma - target_global <= dev)
             model.Add(target_global - soma <= dev)
-            
             penalidades.append(dev)
 
-    # B. Balanceamento Posicional (Por Coluna)
-    
-    # Meta Fixo por coluna
+    # Metas por Coluna (Evitar o 12)
     avg_col_fixo = n_resp / n_slots
     target_fixo = int(round(avg_col_fixo))
     
-    # Meta Rotativo por coluna
     avg_col_rot = (slots_rotativos_total / n_rotativos) / n_slots if n_rotativos > 0 else 0
     target_rot = int(round(avg_col_rot))
     
@@ -156,26 +147,36 @@ def gerar_rodizio_avancado(n_resp, l_fixos, l_rotativos, n_slots):
         for p in range(n_prod):
             soma_col = sum(x[(r, c, p)] for r in range(n_resp))
             
-            if p < n_fixos:
-                t = target_fixo
-            else:
-                t = target_rot
+            t = target_fixo if p < n_fixos else target_rot
             
             diff = model.NewIntVar(0, n_resp, f'diff_{c}_{p}')
             model.Add(soma_col - t <= diff)
             model.Add(t - soma_col <= diff)
-            
             model.Add(diff <= max_desvio_coluna)
-            
             penalidades.append(diff)
 
-    # Função Objetivo Híbrida:
-    # 1. Minimizar a soma dos erros
-    # 2. Minimizar fortemente o MAIOR erro (para evitar o "12" isolado)
-    model.Minimize(sum(penalidades) + (max_desvio_coluna * 10)) 
+    # --- FATOR DE CAOS (ALEATORIEDADE) ---
+    # Introduz entropia para evitar padrões repetitivos (robóticos)
+    random_score = []
+    for r in range(n_resp):
+        for c in range(n_slots):
+            for p in range(n_prod):
+                peso_random = random.randint(1, 100) 
+                random_score.append(x[(r, c, p)] * peso_random)
+
+    # FUNÇÃO OBJETIVO HÍBRIDA
+    # Prioridade 1 (Alta): Minimizar Erro Máximo (max_desvio_coluna)
+    # Prioridade 2 (Média): Minimizar Erro Global (sum penalidades)
+    # Prioridade 3 (Baixa): Maximizar Aleatoriedade (subtrair random_score)
+    
+    model.Minimize(
+        (sum(penalidades) * 1000) +       
+        (max_desvio_coluna * 10000) -     
+        sum(random_score)                 
+    )
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 30.0
+    solver.parameters.max_time_in_seconds = 45.0
     status = solver.Solve(model)
     
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -200,7 +201,7 @@ if btn_processar:
     if qtd_fixos >= produtos_por_pessoa:
         st.error("Configuração Inválida: Produtos fixos ocupam todos os slots.")
     else:
-        with st.spinner('Otimizando distribuição (Nivelamento Estatístico)...'):
+        with st.spinner('Otimizando distribuição (Nivelamento com Entropia)...'):
             df_resultado, status = gerar_rodizio_avancado(
                 num_respondentes, lista_fixos, lista_rotativos, produtos_por_pessoa
             )
@@ -208,7 +209,7 @@ if btn_processar:
         if df_resultado is not None:
             st.session_state['data_matrix_v3'] = df_resultado
             st.session_state['meta_projeto'] = nome_estudo
-            st.success("Matriz gerada! Otimização de nivelamento aplicada.")
+            st.success("Matriz gerada! Otimização híbrida aplicada.")
         else:
             st.error(f"Não foi possível gerar a matriz: {status}")
 
@@ -243,5 +244,6 @@ if 'data_matrix_v3' in st.session_state:
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Matriz', index=False)
             check_df.to_excel(writer, sheet_name='Auditoria', index=False)
+            # Aba Meta removida
             
         st.download_button("Baixar Planilha (.xlsx)", buffer.getvalue(), nome_arq, type="primary")
