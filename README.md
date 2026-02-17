@@ -1,6 +1,6 @@
 Otimizador de Design Experimental
 
-Solução customizada para a Avance Research que moderniza o fluxo de planejamento amostral. Reduz o tempo de criação de rodízios de horas para segundos, garantindo precisão matemática e integridade dos dados.
+Solução customizada para a Advance Research que moderniza o fluxo de planejamento amostral. Reduz o tempo de criação de rodízios de horas para segundos, garantindo precisão matemática e integridade dos dados.
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-App-red)
