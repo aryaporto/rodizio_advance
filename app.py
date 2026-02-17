@@ -3,7 +3,6 @@ import pandas as pd
 from ortools.sat.python import cp_model
 import io
 import re
-import math
 import random
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
@@ -13,237 +12,287 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- CSS PROFISSIONAL ---
+# --- CSS ---
 st.markdown("""
 <style>
     .block-container {padding-top: 1.5rem;}
     h1 {font-family: 'Segoe UI', sans-serif; font-size: 2.0rem; color: #2c3e50;}
     h3 {font-family: 'Segoe UI', sans-serif; font-size: 1.2rem; color: #34495e;}
     .stButton>button {
-        background-color: #2980b9; color: white; border-radius: 5px; height: 3em; font-weight: 600;
+        background-color: #2980b9; color: white; border-radius: 5px; height: 3em; font-weight: 600; width: 100%;
     }
     .stButton>button:hover {background-color: #3498db;}
+    .stAlert {border-radius: 5px;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- SIDEBAR ---
+# --- CLASSE DO OTIMIZADOR ---
+class OtimizadorAlocacao:
+    def __init__(self, fixos, rotativos, slots, df_demografico=None):
+        self.fixos = fixos
+        self.rotativos = rotativos
+        self.todos_produtos = fixos + rotativos
+        self.n_slots = slots
+        self.df_demografico = df_demografico
+        
+        # Se tem arquivo, usa o tamanho do arquivo. Se não, usa o numérico passado.
+        if df_demografico is not None:
+            self.n_respondentes = len(df_demografico)
+        else:
+            self.n_respondentes = 0 # Será setado externamente se não houver df
+            
+    def resolver(self, num_resp_manual=None):
+        # Definição final do N de respondentes
+        n_resp = self.n_respondentes if self.df_demografico is not None else num_resp_manual
+        n_prod = len(self.todos_produtos)
+        n_fixos = len(self.fixos)
+        
+        # Embaralha índices para evitar viés de ordem alfabética na solução
+        indices_produtos = list(range(n_prod))
+        random.shuffle(indices_produtos)
+        
+        model = cp_model.CpModel()
+        
+        # Variáveis de Decisão: x[respondente, slot, produto]
+        x = {}
+        for r in range(n_resp):
+            for c in range(self.n_slots):
+                for p in range(n_prod):
+                    x[(r, c, p)] = model.NewBoolVar(f'x_{r}_{c}_{p}')
+        
+        # --- Regras Invioláveis ---
+        
+        # 1. Exatamente um produto por slot
+        for r in range(n_resp):
+            for c in range(self.n_slots):
+                model.Add(sum(x[(r, c, p)] for p in range(n_prod)) == 1)
+        
+        # 2. O mesmo produto não pode aparecer mais de uma vez para a mesma pessoa
+        for r in range(n_resp):
+            for p in range(n_prod):
+                model.Add(sum(x[(r, c, p)] for c in range(self.n_slots)) <= 1)
+        
+        # 3. Produtos Fixos Obrigatórios (aparecem para todos)
+        # Mapeia o índice original para o índice embaralhado
+        ids_fixos = [i for i, prod in enumerate(self.todos_produtos) if prod in self.fixos]
+        for p_idx in ids_fixos:
+            for r in range(n_resp):
+                model.Add(sum(x[(r, c, p_idx)] for c in range(self.n_slots)) == 1)
+
+        # --- SOFT CONSTRAINTS (Metas de Balanceamento) ---
+        penalidades = []
+        
+        # A. Balanceamento por Posição (Nivelamento Visual)
+        total_slots = n_resp * self.n_slots
+        slots_rotativos = total_slots - (n_resp * n_fixos)
+        n_rotativos = len(self.rotativos)
+        
+        target_rotativo = int(slots_rotativos / n_rotativos / self.n_slots) if n_rotativos > 0 else 0
+        
+        max_desvio_coluna = model.NewIntVar(0, n_resp, 'max_dev_col')
+        
+        for c in range(self.n_slots):
+            for p in range(n_prod):
+                # Se for fixo, o target é n_resp/n_slots (balancear posição)
+                # Se for rotativo, é o target calculado acima
+                is_fixo = self.todos_produtos[p] in self.fixos
+                t = int(n_resp / self.n_slots) if is_fixo else target_rotativo
+                
+                soma_coluna = sum(x[(r, c, p)] for r in range(n_resp))
+                
+                # Cria variável de desvio
+                diff = model.NewIntVar(0, n_resp, f'diff_{c}_{p}')
+                model.Add(soma_coluna - t <= diff)
+                model.Add(t - soma_coluna <= diff)
+                model.Add(diff <= max_desvio_coluna) # Minimax estratégia
+                penalidades.append(diff)
+
+        # B. Balanceamento Demográfico
+        # Se houver dados demográficos, garante que os produtos sejam distribuídos igualmente
+        # dentro de cada subgrupo (Ex: Entre Jovens Classe B, todos veem o prod X igualmente)
+        if self.df_demografico is not None:
+            # Identifica colunas de cota (exclui ID se houver)
+            cols_cota = [c for c in self.df_demografico.columns if c.lower() not in ['id', 'nome', 'participante']]
+            
+            if cols_cota:
+                # Agrupa índices por perfil
+                grupos = self.df_demografico.groupby(cols_cota).groups
+                
+                for nome_grupo, indices in grupos.items():
+                    # indices é a lista de linhas (respondentes) que pertencem a esse grupo
+                    n_pessoas_grupo = len(indices)
+                    if n_pessoas_grupo < 2: continue # Ignora grupos muito pequenos
+                    
+                    # Target esperado dentro desse grupo
+                    # (Quantas vezes o produto X deve aparecer neste grupo?)
+                    target_grupo = int((n_pessoas_grupo * (self.n_slots - n_fixos)) / n_rotativos) if n_rotativos > 0 else 0
+                    
+                    for p in range(n_prod):
+                        if self.todos_produtos[p] in self.rotativos:
+                            soma_grupo = sum(sum(x[(r, c, p)] for c in range(self.n_slots)) for r in indices)
+                            
+                            dev_grupo = model.NewIntVar(0, n_pessoas_grupo, f'dev_g_{nome_grupo}_{p}')
+                            model.Add(soma_grupo - target_grupo <= dev_grupo)
+                            model.Add(target_grupo - soma_grupo <= dev_grupo)
+                            
+                            # Peso alto para garantir representatividade nas cotas
+                            penalidades.append(dev_grupo * 5) 
+
+        # --- FUNÇÃO OBJETIVO ---
+        # Minimizar penalidades + Maximizar Entropia (Random Score)
+        
+        random_score = []
+        for r in range(n_resp):
+            for c in range(self.n_slots):
+                for p in range(n_prod):
+                    # Peso aleatório para quebrar simetrias
+                    w = random.randint(1, 100)
+                    random_score.append(x[(r, c, p)] * w)
+        
+        model.Minimize(sum(penalidades) * 1000 - sum(random_score))
+        
+        # Solver Config
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 60.0
+        solver.parameters.random_seed = random.randint(0, 10000) # Garante aleatoriedade real na seed
+        
+        status = solver.Solve(model)
+        
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            dados_saida = []
+            
+            # Se tiver DF original, pega os dados dele, senão cria IDs sequenciais
+            base_dados = self.df_demografico.to_dict('records') if self.df_demografico is not None else [{'ID': i+1} for i in range(n_resp)]
+            
+            colunas_header = list(base_dados[0].keys()) + [f'Posicao_{k+1}' for k in range(self.n_slots)]
+            
+            for r in range(n_resp):
+                linha = base_dados[r].copy()
+                # Preenche as posições
+                pos_counter = 1
+                for c in range(self.n_slots):
+                    for p in range(n_prod):
+                        if solver.Value(x[(r, c, p)]) == 1:
+                            linha[f'Posicao_{pos_counter}'] = self.todos_produtos[p]
+                            pos_counter += 1
+                dados_saida.append(linha)
+                
+            return pd.DataFrame(dados_saida), "Sucesso"
+        else:
+            return None, "Inviável (Verifique se há slots suficientes para os produtos fixos)"
+
+# --- INTERFACE SIDEBAR ---
 with st.sidebar:
-    # ---------------------------------------------------------
-    # ÁREA DA LOGO
-    # ---------------------------------------------------------
     try:
-        # Certifique-se de ter um arquivo chamado 'logo.png' na mesma pasta
         st.image("logo.png", use_container_width=True)
     except:
-        pass
-    # ---------------------------------------------------------
+        st.write("## 🧪 Allocator Pro")
     
     st.markdown("---")
+    st.header("1. Configuração")
+    nome_estudo = st.text_input("Nome do Estudo", value="Teste_Sensorial_Jan26")
     
-    st.header("Configuração do Estudo")
-    nome_estudo = st.text_input("Nome do Projeto", value="Teste_Sensorial_2024")
+    st.subheader("Definição de Amostra")
+    tipo_input = st.radio("Fonte de Dados:", ["Gerar IDs Numéricos", "Upload de Arquivo (Cotas)"])
     
-    st.subheader("1. Definição da Amostra")
-    num_respondentes = st.number_input("Nº de Respondentes (IDs)", min_value=10, value=128, step=1)
+    df_upload = None
+    num_respondentes = 120
     
+    if tipo_input == "Upload de Arquivo (Cotas)":
+        arquivo = st.file_uploader("Suba Excel/CSV com os perfis", type=['xlsx', 'csv'])
+        if arquivo:
+            try:
+                if arquivo.name.endswith('.csv'):
+                    df_upload = pd.read_csv(arquivo)
+                else:
+                    df_upload = pd.read_excel(arquivo)
+                st.success(f"{len(df_upload)} participantes carregados.")
+            except:
+                st.error("Erro ao ler arquivo.")
+    else:
+        num_respondentes = st.number_input("Nº de IDs a gerar", min_value=12, value=120, step=6)
+        
+    st.markdown("---")
     st.subheader("2. Produtos")
     
-    # Checkbox para múltiplos fixos
-    tem_fixo = st.checkbox("Incluir produtos controle?", value=True)
+    # Inputs de produtos
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        fixos_str = st.text_area("Fixos (Todos veem)", value="", height=100, placeholder="Ex: A, B")
+    with col_p2:
+        rot_str = st.text_area("Rotativos (Rodízio)", value="P1, P2, P3, P4, P5, P6", height=100)
+        
+    lista_fixos = [x.strip() for x in fixos_str.split(',') if x.strip()]
+    lista_rotativos = [x.strip() for x in rot_str.split(',') if x.strip()]
     
-    lista_fixos = []
-    if tem_fixo:
-        input_fixos = st.text_area("Produtos Fixos (Obrigatórios)", 
-                                  value="M42",
-                                  help="Produtos que aparecem para TODOS os respondentes. Separe por vírgula.",
-                                  height=70)
-        lista_fixos = [p.strip() for p in input_fixos.split(',') if p.strip()]
+    total_itens = len(lista_fixos) + len(lista_rotativos)
+    st.caption(f"Total SKUs: {total_itens}")
     
-    input_rotativos = st.text_area("Produtos Rotativos", 
-                                 value="P1, P2, P3, P4, P5, P6, P7, P8, P9",
-                                 help="Produtos distribuídos via bloco incompleto balanceado.",
-                                 height=100)
-    lista_rotativos = [p.strip() for p in input_rotativos.split(',') if p.strip()]
+    st.subheader("3. Design")
+    min_s = len(lista_fixos) + 1 if len(lista_rotativos) > 0 else len(lista_fixos)
+    n_slots = st.slider("Produtos por pessoa (Slots)", min_value=min_s, max_value=max(total_itens, 1), value=min(3, total_itens))
     
-    # Universo
-    todos_produtos = lista_fixos + lista_rotativos
-    total_itens = len(todos_produtos)
-    qtd_fixos = len(lista_fixos)
-    
-    st.info(f"Total de SKUs: {total_itens}")
-    
-    st.subheader("3. Design do Bloco")
-    min_slots = qtd_fixos + 1 if qtd_fixos > 0 else 1
-    
-    produtos_por_pessoa = st.slider("Produtos por pessoa (Slots)", 
-                                   min_value=min_slots, 
-                                   max_value=total_itens, 
-                                   value=min(3, total_itens))
-    
-    if qtd_fixos >= produtos_por_pessoa:
-        st.error(f"Erro: Nº de fixos ({qtd_fixos}) deve ser menor que slots ({produtos_por_pessoa}).")
-
     st.markdown("---")
-    btn_processar = st.button("PROCESSAR ALOCAÇÃO OTIMIZADA", type="primary")
+    btn_processar = st.button("GERAR MATRIZ OTIMIZADA", type="primary")
 
-# --- MOTOR DE OTIMIZAÇÃO (HÍBRIDO: NIVELAMENTO + ENTROPIA) ---
-def gerar_rodizio_avancado(n_resp, l_fixos, l_rotativos, n_slots):
-    todos = l_fixos + l_rotativos
-    n_prod = len(todos)
-    n_fixos = len(l_fixos)
-    n_rotativos = len(l_rotativos)
-    
-    model = cp_model.CpModel()
-    
-    # Variáveis
-    x = {}
-    for r in range(n_resp):
-        for c in range(n_slots):
-            for p in range(n_prod):
-                x[(r, c, p)] = model.NewBoolVar(f'x_{r}_{c}_{p}')
-    
-    # --- HARD CONSTRAINTS ---
-    # 1. Um produto por slot
-    for r in range(n_resp):
-        for c in range(n_slots):
-            model.Add(sum(x[(r, c, p)] for p in range(n_prod)) == 1)
-            
-    # 2. Sem repetição na linha
-    for r in range(n_resp):
-        for p in range(n_prod):
-            model.Add(sum(x[(r, c, p)] for c in range(n_slots)) <= 1)
-            
-    # 3. Fixos obrigatórios
-    for idx in range(n_fixos):
-        for r in range(n_resp):
-            model.Add(sum(x[(r, c, idx)] for c in range(n_slots)) == 1)
-
-    # --- SOFT CONSTRAINTS (PENALIDADES) ---
-    penalidades = []
-    
-    # Metas Globais
-    total_slots = n_resp * n_slots
-    slots_rotativos_total = total_slots - (n_resp * n_fixos)
-    
-    if n_rotativos > 0:
-        target_global = int(round(slots_rotativos_total / n_rotativos))
-        for p in range(n_fixos, n_prod):
-            soma = sum(x[(r, c, p)] for r in range(n_resp) for c in range(n_slots))
-            dev = model.NewIntVar(0, n_resp, f'dev_glob_{p}')
-            model.Add(soma - target_global <= dev)
-            model.Add(target_global - soma <= dev)
-            penalidades.append(dev)
-
-    # Metas por Coluna (Evitar o 12)
-    avg_col_fixo = n_resp / n_slots
-    target_fixo = int(round(avg_col_fixo))
-    
-    avg_col_rot = (slots_rotativos_total / n_rotativos) / n_slots if n_rotativos > 0 else 0
-    target_rot = int(round(avg_col_rot))
-    
-    max_desvio_coluna = model.NewIntVar(0, n_resp, 'max_dev_col')
-
-    for c in range(n_slots):
-        for p in range(n_prod):
-            soma_col = sum(x[(r, c, p)] for r in range(n_resp))
-            
-            t = target_fixo if p < n_fixos else target_rot
-            
-            diff = model.NewIntVar(0, n_resp, f'diff_{c}_{p}')
-            model.Add(soma_col - t <= diff)
-            model.Add(t - soma_col <= diff)
-            model.Add(diff <= max_desvio_coluna)
-            penalidades.append(diff)
-
-    # --- FATOR DE CAOS (ALEATORIEDADE) ---
-    # Introduz entropia para evitar padrões repetitivos (robóticos)
-    random_score = []
-    for r in range(n_resp):
-        for c in range(n_slots):
-            for p in range(n_prod):
-                peso_random = random.randint(1, 100) 
-                random_score.append(x[(r, c, p)] * peso_random)
-
-    # FUNÇÃO OBJETIVO HÍBRIDA
-    # Prioridade 1 (Alta): Minimizar Erro Máximo (max_desvio_coluna)
-    # Prioridade 2 (Média): Minimizar Erro Global (sum penalidades)
-    # Prioridade 3 (Baixa): Maximizar Aleatoriedade (subtrair random_score)
-    
-    model.Minimize(
-        (sum(penalidades) * 1000) +       
-        (max_desvio_coluna * 10000) -     
-        sum(random_score)                 
-    )
-
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 45.0
-    status = solver.Solve(model)
-    
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        dados = []
-        colunas = ['ID'] + [f'Posicao_{k+1}' for k in range(n_slots)]
-        for r in range(n_resp):
-            linha = [r + 1]
-            for c in range(n_slots):
-                for p_idx, p_val in enumerate(todos):
-                    if solver.Value(x[(r, c, p_idx)]) == 1:
-                        linha.append(p_val)
-            dados.append(linha)
-        return pd.DataFrame(dados, columns=colunas), "Sucesso"
-    else:
-        return None, "Inviável"
-
-# --- INTERFACE ---
-
-st.title("Sistema de Planejamento Amostral")
+# --- LÓGICA PRINCIPAL NA TELA ---
+st.title("Sistema de Alocação Balanceada")
 
 if btn_processar:
-    if qtd_fixos >= produtos_por_pessoa:
-        st.error("Configuração Inválida: Produtos fixos ocupam todos os slots.")
+    if len(lista_rotativos) == 0 and len(lista_fixos) == 0:
+        st.warning("Adicione pelo menos um produto.")
     else:
-        with st.spinner('Otimizando distribuição (Nivelamento com Entropia)...'):
-            df_resultado, status = gerar_rodizio_avancado(
-                num_respondentes, lista_fixos, lista_rotativos, produtos_por_pessoa
-            )
+        # Instancia a classe otimizadora
+        motor = OtimizadorAlocacao(lista_fixos, lista_rotativos, n_slots, df_demografico=df_upload)
+        
+        with st.spinner("Calculando melhor distribuição (Balanceamento + Entropia)..."):
+            # Chama o método resolver
+            df_final, status_msg = motor.resolver(num_resp_manual=num_respondentes)
             
-        if df_resultado is not None:
-            st.session_state['data_matrix_v3'] = df_resultado
-            st.session_state['meta_projeto'] = nome_estudo
-            st.success("Matriz gerada! Otimização híbrida aplicada.")
-        else:
-            st.error(f"Não foi possível gerar a matriz: {status}")
+            if df_final is not None:
+                st.session_state['resultado_matrix'] = df_final
+                st.session_state['nome_projeto'] = nome_estudo
+                st.success("Distribuição gerada com sucesso!")
+                
+                # Alerta sobre cotas
+                if df_upload is not None:
+                    cols_usadas = [c for c in df_upload.columns if c.lower() not in ['id','nome']]
+                    st.info(f"💡 Otimização realizada considerando balanceamento nas colunas: {', '.join(cols_usadas)}")
+            else:
+                st.error(f"Erro: {status_msg}")
 
-# VISUALIZAÇÃO
-if 'data_matrix_v3' in st.session_state:
-    df = st.session_state['data_matrix_v3']
+# --- VISUALIZAÇÃO DOS DADOS ---
+if 'resultado_matrix' in st.session_state:
+    df = st.session_state['resultado_matrix']
     
-    check_cols = {}
-    for col in df.columns[1:]:
-        check_cols[col] = df[col].value_counts()
-    check_df = pd.DataFrame(check_cols).fillna(0).astype(int).sort_index()
-    
-    tab1, tab2, tab3 = st.tabs(["Matriz", "Auditoria", "Exportação"])
+    tab1, tab2, tab3 = st.tabs(["📊 Matriz Final", "⚖️ Auditoria de Balanceamento", "📥 Exportar"])
     
     with tab1:
         st.dataframe(df, use_container_width=True)
-        
+    
     with tab2:
-        st.markdown("#### Frequência por Posição")
-        st.caption("Verifique se os produtos rotativos estão nivelados (Ex: entre 9 e 10).")
-        st.dataframe(check_df, use_container_width=True)
+        st.markdown("### Frequência de Exposição")
+        # Conta quantas vezes cada produto aparece
+        cols_pos = [c for c in df.columns if 'Posicao' in c]
+        contagem = pd.Series(df[cols_pos].values.ravel()).value_counts().sort_index()
+        st.bar_chart(contagem)
         
-        # Gráficos
-        st.markdown("---")
-        pos = st.selectbox("Visualizar Posição:", df.columns[1:])
-        st.bar_chart(df[pos].value_counts())
+        st.write("Tabela Detalhada:")
+        st.dataframe(contagem.to_frame(name="Qtd Aparições").T)
 
     with tab3:
         buffer = io.BytesIO()
-        nome_arq = f"{re.sub(r'[^a-zA-Z0-9]', '_', st.session_state['meta_projeto'])}_Final.xlsx"
+        nome_arquivo = f"{st.session_state['nome_projeto']}_Alocacao.xlsx"
         
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Matriz', index=False)
-            check_df.to_excel(writer, sheet_name='Auditoria', index=False)
-            # Aba Meta removida
+            df.to_excel(writer, index=False, sheet_name="Matriz")
+            contagem.to_frame(name="Total").to_excel(writer, sheet_name="Resumo")
             
-        st.download_button("Baixar Planilha (.xlsx)", buffer.getvalue(), nome_arq, type="primary")
+        st.download_button(
+            label="📥 BAIXAR PLANILHA FINAL",
+            data=buffer.getvalue(),
+            file_name=nome_arquivo,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+
