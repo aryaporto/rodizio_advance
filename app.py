@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
-from ortools.sat.python import cp_model
 import io
-import re
 import random
+import math
+from itertools import cycle, islice
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
-    page_title="Sistema de Alocação de Amostras",
+    page_title="Sistema de Alocação (Random + Cotas)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -17,152 +17,121 @@ st.markdown("""
 <style>
     .block-container {padding-top: 1.5rem;}
     h1 {font-family: 'Segoe UI', sans-serif; font-size: 2.0rem; color: #2c3e50;}
+    h3 {font-family: 'Segoe UI', sans-serif; font-size: 1.2rem; color: #34495e;}
     .stButton>button {
         background-color: #2980b9; color: white; border-radius: 5px; height: 3em; font-weight: 600; width: 100%;
     }
     .stButton>button:hover {background-color: #3498db;}
+    .stMetric {background-color: #f0f2f6; padding: 10px; border-radius: 5px;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- CLASSE DO OTIMIZADOR ---
-class OtimizadorAlocacao:
-    def __init__(self, fixos, rotativos, slots, df_demografico=None, cols_cota=None):
+# --- ESTATÍSTICA ---
+def calcular_runs_stats(lista_produtos):
+    """
+    Calcula estatísticas de Runs (Sequências) para validar aleatoriedade.
+    Retorna: Runs Observados, Runs Esperados, Ratio
+    """
+    n = len(lista_produtos)
+    if n == 0: return 0, 0, 0
+    
+    # 1. Conta Runs Observados (quantas vezes muda o produto)
+    runs_obs = 1
+    for i in range(1, n):
+        if lista_produtos[i] != lista_produtos[i-1]:
+            runs_obs += 1
+            
+    # 2. Calcula Runs Esperados (Fórmula de Wald-Wolfowitz Generalizada)
+    # E(R) = N * (1 - soma(pi^2)) + 1
+    counts = pd.Series(lista_produtos).value_counts()
+    soma_quadrados_probs = sum((count / n) ** 2 for count in counts)
+    runs_esp = n * (1 - soma_quadrados_probs) + 1
+    
+    ratio = runs_obs / runs_esp if runs_esp > 0 else 0
+    
+    return runs_obs, runs_esp, ratio
+
+# --- CLASSE DE DISTRIBUIÇÃO ---
+class DistribuidorAleatorio:
+    def __init__(self, fixos, rotativos, n_slots_total):
         self.fixos = fixos
         self.rotativos = rotativos
-        self.todos_produtos = fixos + rotativos
-        self.n_slots = slots
-        self.df_demografico = df_demografico
-        self.cols_cota = cols_cota if cols_cota else [] # Lista de colunas selecionadas pelo usuário
+        self.n_slots_rotativos = n_slots_total - len(fixos)
         
-        if df_demografico is not None:
-            self.n_respondentes = len(df_demografico)
+    def processar(self, df_input, cols_cota):
+        df = df_input.copy()
+        
+        # Prepara colunas
+        total_slots = len(self.fixos) + self.n_slots_rotativos
+        cols_posicao = [f'Posicao_{i+1}' for i in range(total_slots)]
+        
+        for col in cols_posicao:
+            df[col] = None
+
+        # 1. Aloca os FIXOS (sempre nas primeiras posições para organizar)
+        for i, prod_fixo in enumerate(self.fixos):
+            df[cols_posicao[i]] = prod_fixo
+        
+        # Slots restantes para rotativos
+        cols_destino_rotativo = cols_posicao[len(self.fixos):]
+
+        if not cols_destino_rotativo or not self.rotativos:
+            return df
+
+        # 2. Distribuição por Grupo (Cota) ou Geral
+        if not cols_cota:
+            self._distribuir_embaralhado(df, df.index, cols_destino_rotativo)
         else:
-            self.n_respondentes = 0 
-            
-    def resolver(self, num_resp_manual=None):
-        n_resp = self.n_respondentes if self.df_demografico is not None else num_resp_manual
-        n_prod = len(self.todos_produtos)
-        n_fixos = len(self.fixos)
-        
-        # Embaralha produtos para evitar vício de ordem alfabética
-        indices_produtos = list(range(n_prod))
-        random.shuffle(indices_produtos)
-        
-        model = cp_model.CpModel()
-        
-        # Variáveis: x[respondente, slot, produto]
-        x = {}
-        for r in range(n_resp):
-            for c in range(self.n_slots):
-                for p in range(n_prod):
-                    x[(r, c, p)] = model.NewBoolVar(f'x_{r}_{c}_{p}')
-        
-        # --- REGRAS RÍGIDAS (HARD CONSTRAINTS) ---
-        
-        # 1. Um produto por slot
-        for r in range(n_resp):
-            for c in range(self.n_slots):
-                model.Add(sum(x[(r, c, p)] for p in range(n_prod)) == 1)
-        
-        # 2. Não repetir produto para a mesma pessoa
-        for r in range(n_resp):
-            for p in range(n_prod):
-                model.Add(sum(x[(r, c, p)] for c in range(self.n_slots)) <= 1)
-        
-        # 3. Produtos Fixos Obrigatórios
-        ids_fixos = [i for i, prod in enumerate(self.todos_produtos) if prod in self.fixos]
-        for p_idx in ids_fixos:
-            for r in range(n_resp):
-                model.Add(sum(x[(r, c, p_idx)] for c in range(self.n_slots)) == 1)
-
-        # --- REGRAS DE EQUILÍBRIO (SOFT CONSTRAINTS) ---
-        penalidades = []
-        
-        # A. Equilíbrio Global (Todo mundo vê tudo igual no total)
-        total_slots = n_resp * self.n_slots
-        slots_rotativos = total_slots - (n_resp * n_fixos)
-        n_rotativos = len(self.rotativos)
-        target_rotativo_global = int(slots_rotativos / n_rotativos / self.n_slots) if n_rotativos > 0 else 0
-        
-        # Variável para controlar o pior desvio (Minimax)
-        max_desvio = model.NewIntVar(0, n_resp, 'max_dev')
-
-        for p in range(n_prod):
-            is_fixo = self.todos_produtos[p] in self.fixos
-            if not is_fixo:
-                # Conta quantas vezes o produto aparece na posição X (para não viciar posição)
-                for c in range(self.n_slots):
-                    soma_posicao = sum(x[(r, c, p)] for r in range(n_resp))
-                    diff = model.NewIntVar(0, n_resp, f'diff_global_{c}_{p}')
-                    model.Add(soma_posicao - target_rotativo_global <= diff)
-                    model.Add(target_rotativo_global - soma_posicao <= diff)
-                    model.Add(diff <= max_desvio)
-                    penalidades.append(diff)
-
-        # B. Equilíbrio por Cotas
-        if self.df_demografico is not None and len(self.cols_cota) > 0:
-            
-            # Agrupa as linhas do Excel que têm o mesmo perfil nas colunas selecionadas
             try:
-                grupos = self.df_demografico.groupby(self.cols_cota).groups
-            except KeyError:
-                grupos = {} # Fallback se der erro na coluna
+                # Trata NaNs nas colunas de cota para não quebrar o groupby
+                for c in cols_cota:
+                    df[c] = df[c].fillna("N/A")
+                    
+                grupos = df.groupby(cols_cota)
+                for name, group in grupos:
+                    self._distribuir_embaralhado(df, group.index, cols_destino_rotativo)
+            except Exception as e:
+                st.error(f"Erro ao agrupar cotas: {e}")
+                return None
 
-            for nome_grupo, indices in grupos.items():
-                n_pessoas_grupo = len(indices)
-                if n_pessoas_grupo < 2: continue # Ignora grupos muito pequenos
+        return df
 
-                target_grupo = int((n_pessoas_grupo * (self.n_slots - n_fixos)) / n_rotativos) if n_rotativos > 0 else 0
-                
-                for p in range(n_prod):
-                    if self.todos_produtos[p] in self.rotativos:
-                        # Soma aparições APENAS nas linhas desse grupo
-                        soma_grupo = sum(sum(x[(r, c, p)] for c in range(self.n_slots)) for r in indices)
-                        
-                        dev_grupo = model.NewIntVar(0, n_pessoas_grupo, f'dev_g_{p}')
-                        model.Add(soma_grupo - target_grupo <= dev_grupo)
-                        model.Add(target_grupo - soma_grupo <= dev_grupo)
-                        
-                        # Multiplicamos por 10 para dar prioridade ao equilíbrio da Cota sobre o Global
-                        penalidades.append(dev_grupo * 10)
+    def _distribuir_embaralhado(self, df_geral, indices_grupo, cols_destino):
+        qtd_pessoas = len(indices_grupo)
+        qtd_slots_por_pessoa = len(cols_destino)
+        total_posicoes = qtd_pessoas * qtd_slots_por_pessoa
+        
+        if total_posicoes == 0: return
 
-        # --- OBJETIVO FINAL ---
-        # Minimizar erros + Fator de Caos (Entropia) para garantir aleatoriedade
-        random_score = []
-        for r in range(n_resp):
-            for c in range(self.n_slots):
-                for p in range(n_prod):
-                    w = random.randint(1, 50) # Peso aleatório
-                    random_score.append(x[(r, c, p)] * w)
+        # A. Cria o Baralho Balanceado
+        # Gera a sequência exata de produtos necessária para preencher os slots
+        baralho = list(islice(cycle(self.rotativos), total_posicoes))
         
-        model.Minimize(sum(penalidades) * 100 - sum(random_score))
+        # B. Embaralha (Shuffle) - AQUI ESTÁ A ALEATORIEDADE REAL
+        random.shuffle(baralho)
         
-        # Solver
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 60.0
-        # Seed aleatória para garantir que cada clique gere um rodízio diferente
-        solver.parameters.random_seed = random.randint(0, 100000) 
-        
-        status = solver.Solve(model)
-        
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            dados_saida = []
-            base_dados = self.df_demografico.to_dict('records') if self.df_demografico is not None else [{'ID': i+1} for i in range(n_resp)]
+        # C. Distribui
+        contador = 0
+        for idx in indices_grupo:
+            # Produtos já atribuídos a esta pessoa (ex: fixos)
+            linha_atual = df_geral.loc[idx].values.tolist()
             
-            for r in range(n_resp):
-                linha = base_dados[r].copy()
-                pos_counter = 1
-                for c in range(self.n_slots):
-                    for p in range(n_prod):
-                        if solver.Value(x[(r, c, p)]) == 1:
-                            linha[f'Posicao_{pos_counter}'] = self.todos_produtos[p]
-                            pos_counter += 1
-                dados_saida.append(linha)
-            return pd.DataFrame(dados_saida), "Sucesso"
-        else:
-            return None, "Inviável (Verifique nº de slots vs produtos fixos)"
+            for col in cols_destino:
+                carta = baralho[contador]
+                
+                # Tenta evitar repetição imediata na mesma linha (swap simples)
+                # Se a carta sorteada já existe na linha desta pessoa...
+                if carta in [x for x in df_geral.loc[idx, cols_destino] if x is not None] or carta in self.fixos:
+                    # Tenta pegar a próxima carta do monte se possível
+                    if contador + 1 < len(baralho):
+                        # Troca
+                        baralho[contador], baralho[contador+1] = baralho[contador+1], baralho[contador]
+                        carta = baralho[contador]
+                
+                df_geral.at[idx, col] = carta
+                contador += 1
 
-# --- INTERFACE ---
+# --- INTERFACE (SIDEBAR) ---
 with st.sidebar:
     try:
         st.image("logo.png", use_container_width=True)
@@ -190,22 +159,17 @@ with st.sidebar:
                     df_upload = pd.read_excel(arquivo)
                 st.success(f"✅ {len(df_upload)} linhas carregadas.")
                 
-                # --- AQUI ESTÁ A CORREÇÃO: SELEÇÃO MANUAL DE COTAS ---
                 st.markdown("**Balanceamento (Cotas):**")
-                cols_possiveis = [c for c in df_upload.columns if c.lower() not in ['id', 'nome']]
+                cols_ignorar = ['id', 'nome', 'participante', 'telefone', 'email', 'obs', 'data']
+                cols_possiveis = [c for c in df_upload.columns if c.lower() not in cols_ignorar]
+                
                 cols_selecionadas = st.multiselect(
                     "Selecione as colunas para equilibrar:",
                     options=cols_possiveis,
-                    help="O sistema tentará distribuir os produtos igualmente dentro desses grupos."
+                    help="O sistema garantirá que cada grupo receba a mesma quantidade de produtos."
                 )
-                if cols_selecionadas:
-                    st.caption(f"Otimizando por: {', '.join(cols_selecionadas)}")
-                else:
-                    st.caption("⚠️ Nenhuma cota selecionada (Rodízio Aleatório Global).")
-                # -----------------------------------------------------
-
             except Exception as e:
-                st.error(f"Erro: {e}")
+                st.error(f"Erro ao ler arquivo: {e}")
     else:
         num_respondentes = st.number_input("Nº de IDs a gerar", min_value=12, value=120, step=6)
         
@@ -214,9 +178,9 @@ with st.sidebar:
     
     c1, c2 = st.columns(2)
     with c1:
-        fixos_str = st.text_area("Fixos", height=100, placeholder="Ex: A")
+        fixos_str = st.text_area("Fixos (Todos veem)", height=100, placeholder="Ex: A")
     with c2:
-        rot_str = st.text_area("Rotativos", value="P1, P2, P3", height=100)
+        rot_str = st.text_area("Rotativos (Rodízio)", value="P1, P2, P3", height=100)
         
     lista_fixos = [x.strip() for x in fixos_str.split(',') if x.strip()]
     lista_rotativos = [x.strip() for x in rot_str.split(',') if x.strip()]
@@ -225,63 +189,106 @@ with st.sidebar:
     
     st.subheader("3. Slots")
     min_s = len(lista_fixos) + 1 if len(lista_rotativos) > 0 else len(lista_fixos)
-    n_slots = st.slider("Produtos por pessoa", min_value=min_s, max_value=max(total_itens, 1), value=min(3, total_itens))
+    n_slots = st.slider("Produtos por pessoa (Total)", min_value=min_s, max_value=max(total_itens, 1), value=min(3, total_itens))
     
     st.markdown("---")
-    btn_processar = st.button("GERAR MATRIZ", type="primary")
+    btn_processar = st.button("GERAR RODÍZIO", type="primary")
 
-# --- LÓGICA PRINCIPAL ---
+# --- LÓGICA PRINCIPAL (MAIN) ---
 st.title("Sistema de Alocação Balanceada")
 
 if btn_processar:
     if len(lista_rotativos) == 0 and len(lista_fixos) == 0:
         st.warning("Adicione produtos.")
     else:
-        # Passamos as colunas selecionadas para a classe
-        motor = OtimizadorAlocacao(
-            lista_fixos, 
-            lista_rotativos, 
-            n_slots, 
-            df_demografico=df_upload, 
-            cols_cota=cols_selecionadas  # <--- PASSANDO A ESCOLHA DO USUÁRIO
-        )
+        # Prepara base
+        if df_upload is not None:
+            df_base = df_upload
+        else:
+            df_base = pd.DataFrame({'ID': range(1, num_respondentes + 1)})
+
+        distribuidor = DistribuidorAleatorio(lista_fixos, lista_rotativos, n_slots)
         
-        with st.spinner("Calculando melhor distribuição..."):
-            df_final, status_msg = motor.resolver(num_resp_manual=num_respondentes)
+        with st.spinner("Embaralhando e distribuindo..."):
+            df_final = distribuidor.processar(df_base, cols_selecionadas)
             
             if df_final is not None:
                 st.session_state['res_matrix'] = df_final
                 st.session_state['proj_nome'] = nome_estudo
-                st.success("Matriz Gerada!")
+                st.success("Distribuição realizada com sucesso!")
             else:
-                st.error(f"Erro: {status_msg}")
+                st.error("Erro no processamento.")
 
-# --- VISUALIZAÇÃO ---
+# --- VISUALIZAÇÃO DOS RESULTADOS ---
 if 'res_matrix' in st.session_state:
     df = st.session_state['res_matrix']
     
-    tab1, tab2 = st.tabs(["📊 Matriz", "📥 Exportar"])
+    # Identifica colunas rotativas para análise
+    cols_rotativas = [c for c in df.columns if 'Posicao' in c and df[c].iloc[0] not in lista_fixos]
+    
+    tab1, tab2, tab3 = st.tabs(["📊 Matriz", "🎲 Auditoria (Runs Test)", "📥 Exportar"])
     
     with tab1:
         st.dataframe(df, use_container_width=True)
-        
-        # Auditoria rápida visual
-        st.markdown("#### Checagem de Balanceamento")
         if cols_selecionadas:
-            col_check = st.selectbox("Verificar equilíbrio por:", cols_selecionadas)
-            col_pos = [c for c in df.columns if 'Posicao' in c]
-            
-            # Cria uma tabela cruzada: Cota vs Produtos
-            df_long = df.melt(id_vars=[col_check], value_vars=col_pos, value_name="Produto")
-            crosstab = pd.crosstab(df_long[col_check], df_long['Produto'])
-            st.dataframe(crosstab)
-        else:
-            col_pos = [c for c in df.columns if 'Posicao' in c]
-            st.bar_chart(pd.Series(df[col_pos].values.ravel()).value_counts())
+            st.info(f"Balanceamento aplicado dentro de: {', '.join(cols_selecionadas)}")
 
     with tab2:
+        st.markdown("### Teste de Aleatoriedade (Runs Test)")
+        st.write("Verifica se os produtos estão alternando de forma natural ou se há vícios.")
+        
+        if cols_rotativas:
+            # Pega a primeira coluna rotativa para análise (amostra)
+            col_teste = cols_rotativas[0]
+            
+            # Se houver cota, analisamos dentro do maior grupo para ser justo
+            if cols_selecionadas:
+                col_cota = cols_selecionadas[0]
+                maior_grupo = df[col_cota].value_counts().idxmax()
+                st.caption(f"Analisando grupo: **{col_cota} = {maior_grupo}** (Coluna: {col_teste})")
+                sequencia = df[df[col_cota] == maior_grupo][col_teste].tolist()
+            else:
+                st.caption(f"Analisando Total Geral (Coluna: {col_teste})")
+                sequencia = df[col_teste].tolist()
+            
+            # Cálculo Estatístico
+            r_obs, r_esp, ratio = calcular_runs_stats(sequencia)
+            
+            # Exibição
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Trocas (Runs) Observadas", r_obs)
+            c2.metric("Trocas (Runs) Esperadas", f"{r_esp:.1f}")
+            
+            status_delta = "OK"
+            status_color = "normal"
+            
+            if 0.85 <= ratio <= 1.15:
+                status_text = "✅ Aleatoriedade Aprovada"
+                msg_detail = "A sequência apresenta variação natural."
+            elif ratio < 0.85:
+                status_text = "⚠️ Poucas Trocas (Agrupado)"
+                msg_detail = "Os produtos estão repetindo em blocos (ex: AAABBB). Pode indicar viés de agrupamento."
+                status_delta = "- Baixo"
+                status_color = "inverse"
+            else:
+                status_text = "⚠️ Muitas Trocas (Alternado)"
+                msg_detail = "Os produtos estão alternando demais (ex: ABABAB). Parece artificial."
+                status_delta = "+ Alto"
+                status_color = "inverse"
+                
+            c3.metric("Status Estatístico", status_text, delta=status_delta, delta_color=status_color)
+            st.info(msg_detail)
+            
+            st.markdown("---")
+            st.markdown("#### Distribuição Visual")
+            st.bar_chart(pd.Series(sequencia).value_counts())
+            
+        else:
+            st.warning("Não há colunas rotativas suficientes para análise.")
+
+    with tab3:
         buffer = io.BytesIO()
         nome_arquivo = f"{st.session_state['proj_nome']}_Final.xlsx"
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             df.to_excel(writer, index=False)
-        st.download_button("Baixar Excel", buffer.getvalue(), nome_arquivo, type="primary")
+        st.download_button("Baixar Excel (.xlsx)", buffer.getvalue(), nome_arquivo, type="primary")
